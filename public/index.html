@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bancada WhatsApp</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="banner" class="banner" hidden></div>
+    <div class="shell" id="shell" data-view="list">
+      <aside class="side" aria-label="Conversas">
+        <header class="brand">
+          <h1>Bancada</h1>
+          <p id="tenant" class="mono"></p>
+        </header>
+        <form id="new-form" class="new">
+          <label for="new-number">Número de destino</label>
+          <div class="new-row">
+            <input id="new-number" class="mono" inputmode="numeric" autocomplete="off" placeholder="5511999999999" />
+            <button type="submit" class="btn solid">Abrir</button>
+          </div>
+          <button type="button" id="check" class="link">Verificar se tem WhatsApp</button>
+          <p id="check-result" class="hint" role="status"></p>
+        </form>
+        <ul id="conversations" class="conversations"></ul>
+      </aside>
+
+      <main class="chat">
+        <header class="chat-head">
+          <button type="button" id="back" class="btn back">Conversas</button>
+          <div class="chat-title">
+            <h2 id="chat-title">Nenhuma conversa aberta</h2>
+            <p id="chat-sub" class="mono"></p>
+          </div>
+          <button type="button" id="open-inspector" class="btn back">Painel</button>
+        </header>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="composer" class="composer" hidden>
+          <p id="send-error" class="send-error" role="alert" hidden></p>
+          <div id="attachment" class="attachment" hidden></div>
+          <div class="composer-row">
+            <label class="btn attach">
+              Anexar
+              <input id="file" type="file" hidden />
+            </label>
+            <textarea id="text" rows="1" placeholder="Escreva a mensagem" aria-label="Mensagem"></textarea>
+            <button type="submit" id="send" class="btn solid">Enviar</button>
+          </div>
+        </form>
+      </main>
+
+      <aside class="inspector" aria-label="Painel do gateway">
+        <button type="button" id="close-inspector" class="btn back">Voltar ao chat</button>
+        <section>
+          <h3>Pool <span id="pool-state" class="tag"></span></h3>
+          <div id="pool"></div>
+        </section>
+        <section id="selected-section" hidden>
+          <h3>Mensagem</h3>
+          <div id="selected"></div>
+        </section>
+        <section class="events-section">
+          <h3>Webhooks recebidos</h3>
+          <div id="events" class="events"></div>
+        </section>
+      </aside>
+    </div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
