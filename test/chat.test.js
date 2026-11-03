@@ -5,6 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, beforeEach, test } from 'node:test';
+import { parseList } from '../src/batch.js';
 import { conversationKey } from '../src/phone.js';
 import { createServer } from '../src/server.js';
 import { Store } from '../src/store.js';
@@ -17,6 +18,8 @@ const gateway = {
   async send(payload) {
     this.calls.push(payload);
     if (payload.to === 'invalido') return { status: 422, body: { error: { code: 'INVALID', message: 'to' } } };
+    if (payload.to === '5511900000422') return { status: 422, body: { error: { code: 'INVALID', message: 'to' } } };
+    if (payload.to === '5511900000429') return { status: 429, body: { error: { code: 'QUEUE_FULL', message: 'cheia' } } };
     return {
       status: 202,
       body: {
@@ -26,6 +29,13 @@ const gateway = {
         status: 'queued',
         createdAt: new Date().toISOString(),
       },
+    };
+  },
+  async checkNumbers(numbers) {
+    if (numbers.length > 50) return { status: 422, body: { error: { code: 'TOO_MANY', message: 'numbers' } } };
+    return {
+      status: 200,
+      body: { results: numbers.map((number) => ({ number, exists: number !== '5511900000000' })) },
     };
   },
 };
@@ -214,6 +224,115 @@ test('anexo recebido de tipo perigoso é servido como download', async () => {
   assert.equal(res.headers.get('content-type'), 'application/octet-stream');
   assert.match(res.headers.get('content-disposition'), /^attachment/);
   assert.equal(res.headers.get('content-security-policy'), 'sandbox');
+});
+
+const postJson = (url, body) =>
+  fetch(`${base}${url}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+const sendBatch = (numbers, text = 'oi') =>
+  postJson('/api/batches', { recipients: numbers.map((n) => (typeof n === 'string' ? { number: n } : n)), text });
+
+test('lista do lote separa inválidos, repetidos e nome', () => {
+  const { recipients, invalid, duplicates } = parseList(
+    '+55 11 99999-9999;Maria\n\n123\n551199999999\n5521988887777,João Silva\r\n',
+  );
+  assert.deepEqual(recipients, [
+    { number: '5511999999999', name: 'Maria' },
+    { number: '5521988887777', name: 'João Silva' },
+  ]);
+  assert.deepEqual(invalid, ['123']);
+  assert.deepEqual(duplicates, ['551199999999']);
+});
+
+test('verificação do lote marca quem não tem WhatsApp', async () => {
+  const res = await postJson('/api/batches/check', { list: '5511999999999\n5511900000000' });
+  const { recipients } = await res.json();
+  assert.deepEqual(recipients.map((r) => r.exists), [true, false]);
+  assert.equal(gateway.calls.length, 0);
+});
+
+test('lote acima do teto é recusado sem enviar nada', async () => {
+  const numbers = Array.from({ length: 81 }, (_, i) => String(5511900001000 + i));
+  const res = await sendBatch(numbers);
+  assert.equal(res.status, 422);
+  assert.equal((await res.json()).error.code, 'BATCH_TOO_LARGE');
+  assert.equal(gateway.calls.length, 0);
+});
+
+test('lote de 80 passa pelo teto de 50 da verificação e é enviado', async () => {
+  const numbers = Array.from({ length: 80 }, (_, i) => String(5511900001000 + i));
+  const check = await postJson('/api/batches/check', { list: numbers.join('\n') });
+  assert.equal(check.status, 200);
+  const { recipients } = await check.json();
+  assert.equal(recipients.filter((r) => r.exists).length, 80);
+  const body = await (await sendBatch(numbers)).json();
+  assert.equal(body.accepted, 80);
+});
+
+test('lote troca {nome} e cada envio leva chave própria', async () => {
+  const res = await sendBatch(
+    [
+      { number: '5511999999999', name: 'Maria' },
+      { number: '5521988887777', name: 'João' },
+    ],
+    'Olá, {nome}!',
+  );
+  const body = await res.json();
+  assert.equal(body.accepted, 2);
+  assert.deepEqual(gateway.calls.map((c) => c.text), ['Olá, Maria!', 'Olá, João!']);
+  assert.notEqual(gateway.calls[0].idempotencyKey, gateway.calls[1].idempotencyKey);
+  assert.equal(store.batches()[0].total, 2);
+  assert.equal(store.messagesOfBatch(body.batchId).length, 2);
+});
+
+test('{nome} sem nome na lista recusa o lote antes do primeiro envio', async () => {
+  const res = await sendBatch([{ number: '5511999999999', name: 'Maria' }, { number: '5521988887777' }], 'Olá, {nome}!');
+  assert.equal(res.status, 422);
+  assert.equal(gateway.calls.length, 0);
+});
+
+test('recusa de um número não para o lote', async () => {
+  const body = await (await sendBatch(['5511900000422', '5511999999999'])).json();
+  assert.equal(body.accepted, 1);
+  assert.equal(body.rejected[0].number, '5511900000422');
+  assert.equal(body.skipped.length, 0);
+});
+
+test('fila cheia para o lote e o resto não é enviado', async () => {
+  const body = await (await sendBatch(['5511999999999', '5511900000429', '5521988887777'])).json();
+  assert.equal(body.accepted, 1);
+  assert.equal(body.rejected[0].error.code, 'QUEUE_FULL');
+  assert.deepEqual(body.skipped.map((s) => s.number), ['5521988887777']);
+  assert.equal(gateway.calls.length, 2);
+});
+
+test('status do webhook aparece no resumo do lote', async () => {
+  const { batchId } = await (await sendBatch(['5511999999999'])).json();
+  const [m] = store.messagesOfBatch(batchId);
+  await deliver(statusEvent(m.id, 'delivered'));
+  const res = await fetch(`${base}/api/batches`);
+  const { batches } = await res.json();
+  assert.deepEqual(batches[0].counts, { delivered: 1 });
+});
+
+test('txt conta por dia só o que saiu, sem somar evento repetido', async () => {
+  const day = (d) => new Date(2026, 9, d, 12).toISOString();
+  const a = await (await sendText()).json();
+  const b = await (await sendText()).json();
+  const failed = await (await sendText()).json();
+  await sendText();
+  const sent = statusEvent(a.id, 'sent', { at: day(29) });
+  await deliver(sent);
+  await deliver(sent);
+  await deliver(statusEvent(a.id, 'delivered', { at: day(30) }));
+  await deliver(statusEvent(b.id, 'delivered', { at: day(30) }));
+  await deliver(statusEvent(failed.id, 'failed', { failureReason: 'UNCONFIRMED', at: day(30) }));
+  store.flush();
+  assert.equal(fs.readFileSync(store.sentFile, 'utf8'), '2026-10-29 1\n2026-10-30 1\n');
 });
 
 test('rotas não saem de public/', async () => {

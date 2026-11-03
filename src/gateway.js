@@ -57,7 +57,11 @@ export class GatewayClient {
   }
 
   checkNumber(number) {
-    return this.call('POST', this.tenantPath('/numbers/check'), { numbers: [number] });
+    return this.checkNumbers([number]);
+  }
+
+  checkNumbers(numbers) {
+    return this.call('POST', this.tenantPath('/numbers/check'), { numbers });
   }
 
   health() {

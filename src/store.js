@@ -13,10 +13,14 @@ const RANK = { queued: 0, failed: 1, sent: 2, delivered: 3, read: 4 };
 export class Store {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'chat.json');
+    this.sentFile = path.join(dataDir, 'envios-por-dia.txt');
     this.mediaDir = path.join(dataDir, 'media');
     fs.mkdirSync(this.mediaDir, { recursive: true });
     this.state = { messages: [], events: [], seenEvents: [] };
-    if (fs.existsSync(this.file)) this.state = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+    if (fs.existsSync(this.file)) {
+      this.state = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      this.writeSentByDay();
+    }
     this.timer = null;
   }
 
@@ -30,6 +34,17 @@ export class Store {
     const tmp = `${this.file}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(this.state));
     fs.renameSync(tmp, this.file);
+    this.writeSentByDay();
+  }
+
+  /// O arquivo é só um relatório: se estiver travado por outro programa, sai na próxima gravação.
+  writeSentByDay() {
+    const lines = this.sentByDay().map(({ day, total }) => `${day} ${total}\n`);
+    try {
+      fs.writeFileSync(this.sentFile, lines.join(''));
+    } catch (err) {
+      console.error(`Não gravou ${this.sentFile}: ${err.message}`);
+    }
   }
 
   /// true na primeira vez que o evento aparece. A entrega é "pelo menos uma vez".
@@ -51,7 +66,7 @@ export class Store {
   }
 
   /// Cria o registro da mensagem aceita. O webhook pode ter chegado antes do 202: nesse caso completa o que existe.
-  addOutbound({ view, text, media }) {
+  addOutbound({ view, text, media, batchId }) {
     let m = this.find(view.messageId);
     if (!m) {
       m = { id: view.messageId, status: 'queued', times: {} };
@@ -63,6 +78,7 @@ export class Store {
       number: view.to,
       text: text ?? null,
       media: media ?? null,
+      batchId: batchId ?? null,
       idempotencyKey: view.idempotencyKey,
       createdAt: view.createdAt,
     });
@@ -151,6 +167,38 @@ export class Store {
     return this.state.messages
       .filter((m) => m.key === key)
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  }
+
+  messagesOfBatch(id) {
+    return this.state.messages
+      .filter((m) => m.batchId === id)
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  }
+
+  /// O lote não tem registro próprio: o resumo sai das mensagens, que o webhook mantém em dia.
+  batches() {
+    const byId = new Map();
+    for (const m of this.state.messages) {
+      if (!m.batchId) continue;
+      const b = byId.get(m.batchId) ?? { id: m.batchId, createdAt: m.createdAt, total: 0, counts: {} };
+      b.total += 1;
+      b.counts[m.status] = (b.counts[m.status] ?? 0) + 1;
+      if (m.createdAt < b.createdAt) b.createdAt = m.createdAt;
+      byId.set(m.batchId, b);
+    }
+    return [...byId.values()].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  }
+
+  /// Sai das mensagens, como o lote: evento repetido não soma duas vezes. Conta o que saiu, não o que entrou na fila.
+  sentByDay() {
+    const byDay = new Map();
+    for (const m of this.state.messages) {
+      if (m.direction === 'in' || !(RANK[m.status] >= RANK.sent)) continue;
+      const at = m.times.sent ?? m.times.delivered ?? m.times.read ?? m.lastAt ?? m.createdAt;
+      const day = new Date(at).toLocaleDateString('sv-SE');
+      byDay.set(day, (byDay.get(day) ?? 0) + 1);
+    }
+    return [...byDay].sort(([a], [b]) => (a < b ? -1 : 1)).map(([day, total]) => ({ day, total }));
   }
 }
 

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { CHECK_CHUNK, MAX_BATCH, cleanRecipients, parseList, renderText, stopsBatch, usesName } from './batch.js';
 import { ROOT, configFrom, loadEnvFile } from './config.js';
 import { GatewayClient } from './gateway.js';
 import { normalizePhone } from './phone.js';
@@ -107,29 +108,91 @@ export function createServer({ config, store, gateway, downloadMedia = downloadI
     notices.forEach(broadcast);
   }
 
+  /// Pede o envio ao gateway e, se aceito, grava a mensagem. Devolve a resposta do gateway e a mensagem criada.
+  async function dispatch({ to, text, media, batchId }) {
+    const r = await gateway.send({
+      idempotencyKey: `chat-${crypto.randomUUID()}`,
+      cedenteRef: config.cedenteRef,
+      to,
+      text: text || undefined,
+      media: media || undefined,
+    });
+    if (r.status !== 202) return { r };
+
+    let stored = null;
+    if (media) {
+      const { type, fileName, mimeType, base64, ptt } = media;
+      const file = mediaFileName(r.body.messageId, mimeType);
+      fs.writeFileSync(path.join(store.mediaDir, file), Buffer.from(base64, 'base64'));
+      stored = { kind: type, fileName: fileName ?? null, mimeType, file, ptt: Boolean(ptt) };
+    }
+    const m = store.addOutbound({ view: r.body, text, media: stored, batchId });
+    broadcast({ type: 'message', key: m.key, id: m.id });
+    return { r, m };
+  }
+
   async function sendMessage(req, res) {
     const body = await readJson(req);
     if (!body) return apiError(res, 400, 'INVALID_JSON', 'Corpo JSON obrigatório');
-    const payload = {
-      idempotencyKey: `chat-${crypto.randomUUID()}`,
-      cedenteRef: config.cedenteRef,
-      to: body.to,
-      text: body.text || undefined,
-      media: body.media || undefined,
-    };
-    const r = await gateway.send(payload);
-    if (r.status !== 202) return json(res, r.status, r.body);
-
-    let media = null;
-    if (body.media) {
-      const { type, fileName, mimeType, base64, ptt } = body.media;
-      const file = mediaFileName(r.body.messageId, mimeType);
-      fs.writeFileSync(path.join(store.mediaDir, file), Buffer.from(base64, 'base64'));
-      media = { kind: type, fileName: fileName ?? null, mimeType, file, ptt: Boolean(ptt) };
-    }
-    const m = store.addOutbound({ view: r.body, text: body.text, media });
-    broadcast({ type: 'message', key: m.key, id: m.id });
+    const { r, m } = await dispatch({ to: body.to, text: body.text, media: body.media });
+    if (!m) return json(res, r.status, r.body);
     json(res, 202, m);
+  }
+
+  async function checkBatch(req, res) {
+    const body = await readJson(req);
+    if (!body) return apiError(res, 400, 'INVALID_JSON', 'Corpo JSON obrigatório');
+    const { recipients, invalid, duplicates } = parseList(body.list);
+    if (!recipients.length) return apiError(res, 422, 'EMPTY_BATCH', 'Nenhum número válido na lista');
+    if (recipients.length > MAX_BATCH) {
+      return apiError(res, 422, 'BATCH_TOO_LARGE', `Máximo de ${MAX_BATCH} números por lote`);
+    }
+    const found = new Map();
+    for (let i = 0; i < recipients.length; i += CHECK_CHUNK) {
+      const r = await gateway.checkNumbers(recipients.slice(i, i + CHECK_CHUNK).map((x) => x.number));
+      if (r.status !== 200) return json(res, r.status, r.body);
+      for (const x of r.body.results) found.set(x.number, x.exists);
+    }
+    json(res, 200, {
+      recipients: recipients.map((x) => ({ ...x, exists: found.get(x.number) ?? null })),
+      invalid,
+      duplicates,
+    });
+  }
+
+  async function sendBatch(req, res) {
+    const body = await readJson(req);
+    if (!body) return apiError(res, 400, 'INVALID_JSON', 'Corpo JSON obrigatório');
+    const recipients = cleanRecipients(body.recipients);
+    if (!recipients.length) return apiError(res, 422, 'EMPTY_BATCH', 'Nenhum número válido na lista');
+    if (recipients.length > MAX_BATCH) {
+      return apiError(res, 422, 'BATCH_TOO_LARGE', `Máximo de ${MAX_BATCH} números por lote`);
+    }
+    if (!body.text && !body.media) return apiError(res, 422, 'EMPTY_MESSAGE', 'Escreva a mensagem ou anexe um arquivo');
+    if (usesName(body.text) && recipients.some((x) => !x.name)) {
+      return apiError(res, 422, 'MISSING_NAME', 'A mensagem usa {nome}, mas há número sem nome na lista');
+    }
+
+    const batchId = crypto.randomUUID();
+    const rejected = [];
+    const skipped = [];
+    let accepted = 0;
+    let stopped = false;
+    for (const { number, name } of recipients) {
+      if (stopped) {
+        skipped.push({ number, name });
+        continue;
+      }
+      const text = renderText(body.text, name);
+      const { r, m } = await dispatch({ to: number, text, media: body.media, batchId });
+      if (m) {
+        accepted += 1;
+      } else {
+        rejected.push({ number, name, status: r.status, error: r.body?.error ?? null });
+        stopped = stopsBatch(r.status);
+      }
+    }
+    json(res, 200, { batchId, accepted, rejected, skipped });
   }
 
   async function checkNumber(req, res) {
@@ -210,9 +273,15 @@ export function createServer({ config, store, gateway, downloadMedia = downloadI
     }
     if (method === 'POST' && pathname === '/api/messages') return sendMessage(req, res);
     if (method === 'POST' && pathname === '/api/numbers/check') return checkNumber(req, res);
+    if (method === 'GET' && pathname === '/api/batches') return json(res, 200, { batches: store.batches() });
+    if (method === 'POST' && pathname === '/api/batches') return sendBatch(req, res);
+    if (method === 'POST' && pathname === '/api/batches/check') return checkBatch(req, res);
 
     let m = /^\/api\/conversations\/([^/]+)\/messages$/.exec(pathname);
     if (method === 'GET' && m) return json(res, 200, { messages: store.messagesOf(decodeURIComponent(m[1])) });
+
+    m = /^\/api\/batches\/([^/]+)$/.exec(pathname);
+    if (method === 'GET' && m) return json(res, 200, { messages: store.messagesOfBatch(decodeURIComponent(m[1])) });
 
     m = /^\/api\/messages\/([^/]+)\/refresh$/.exec(pathname);
     if (method === 'POST' && m) return refreshMessage(res, decodeURIComponent(m[1]));

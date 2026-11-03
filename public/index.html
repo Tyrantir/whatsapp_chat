@@ -28,6 +28,7 @@
           </div>
           <button type="button" id="check" class="link">Verificar se tem WhatsApp</button>
           <p id="check-result" class="hint" role="status"></p>
+          <button type="button" id="open-batch" class="link">Envio em lote</button>
         </form>
         <ul id="conversations" class="conversations"></ul>
       </aside>
@@ -42,6 +43,30 @@
           <button type="button" id="open-inspector" class="btn back">Painel</button>
         </header>
         <div id="messages" class="messages" aria-live="polite"></div>
+        <section id="batch" class="batch" aria-label="Envio em lote" hidden>
+          <form id="batch-form" class="batch-form">
+            <label for="batch-list">Destinatários</label>
+            <textarea id="batch-list" class="mono" rows="6" autocomplete="off" placeholder="5511999999999;Maria&#10;5521988887777;João"></textarea>
+            <p class="hint">Um por linha, com o nome depois de <code>;</code> para usar <code>{nome}</code>. Máximo de 80.</p>
+            <label for="batch-text">Mensagem</label>
+            <textarea id="batch-text" rows="3" placeholder="Olá, {nome}!"></textarea>
+            <p class="hint">Texto igual para muita gente é risco de ban: use <code>{nome}</code>.</p>
+            <div id="batch-attachment" class="attachment" hidden></div>
+            <div class="batch-actions">
+              <label class="btn attach">
+                Anexar
+                <input id="batch-file" type="file" hidden />
+              </label>
+              <button type="button" id="batch-check" class="btn">Verificar números</button>
+              <button type="submit" id="batch-send" class="btn solid" disabled>Enviar</button>
+            </div>
+            <p id="batch-error" class="send-error" role="alert" hidden></p>
+          </form>
+          <div id="batch-review"></div>
+          <div id="batch-progress"></div>
+          <h3 class="batch-title">Lotes enviados</h3>
+          <ul id="batch-history" class="batch-history"></ul>
+        </section>
         <form id="composer" class="composer" hidden>
           <p id="send-error" class="send-error" role="alert" hidden></p>
           <div id="attachment" class="attachment" hidden></div>

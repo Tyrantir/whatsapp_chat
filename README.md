@@ -55,15 +55,21 @@ npm start   # http://127.0.0.1:3100
 
 - Texto, imagem, vídeo, documento e áudio (com a opção de mensagem de voz), até 14 MB
 - Validação de número (`numbers/check`)
+- Envio em lote: até 80 destinatários por vez, com `{nome}` no texto, anexo opcional e andamento de cada mensagem
 - Percurso de cada mensagem: fila, enviada, entregue e lida, com o tempo entre as etapas
 - Retenções (`holdReason`) e falhas (`failureReason`), e as recusas 4xx do gateway com a mensagem original
 - Resposta do contato, com anexo baixado para `data/media`
 - Estado do pool, uso diário e fila pendente
+- Total de mensagens enviadas por dia em `data/envios-por-dia.txt` (`AAAA-MM-DD total`), recalculado a cada gravação
 - Todo webhook recebido, com o JSON cru; assinatura inválida e evento repetido ficam marcados
 - Clique numa mensagem para ver ids e consultar `GET /messages/{id}`
 
 O gateway mantém o ritmo anti-ban: entre uma mensagem e outra do mesmo número há 15 a 30 s. Fila andando devagar é o
 comportamento esperado.
+
+O lote só envia para quem passou na verificação de número. Recusa de um número não interrompe o lote; `429`, `401`,
+`403` e falha do gateway interrompem, e o que faltava aparece como não enviado. Número em aquecimento faz 30
+mensagens no primeiro estágio: o excedente fica retido por `DAILY_LIMIT`.
 
 ## Testes
 

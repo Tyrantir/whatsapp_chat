@@ -33,6 +33,15 @@ const state = {
   selectedId: null,
   file: null,
   sending: false,
+  pool: null,
+  batchOpen: false,
+  batchFile: null,
+  batchReview: null, // resposta de /api/batches/check; some quando a lista muda
+  batchSending: false,
+  batchId: null,
+  batchOutcome: null, // { rejected, skipped } da resposta do envio
+  batchMessages: [],
+  batches: [],
 };
 
 function h(tag, props = {}, ...children) {
@@ -110,9 +119,12 @@ function renderConversations() {
 async function openConversation(c) {
   state.active = c;
   state.selectedId = null;
+  state.batchOpen = false;
   $('chat-title').textContent = c.number ?? 'Contato sem número';
   $('chat-sub').textContent = c.number ? '' : (c.lid ?? '');
   $('composer').hidden = false;
+  $('messages').hidden = false;
+  $('batch').hidden = true;
   setView('chat');
   renderConversations();
   renderSelected();
@@ -348,6 +360,17 @@ function toBase64(file) {
   });
 }
 
+async function mediaPayload(file, ptt) {
+  const type = mediaType(file);
+  return {
+    type,
+    base64: await toBase64(file),
+    mimeType: file.type || 'application/octet-stream',
+    fileName: file.name,
+    ptt: type === 'audio' ? ptt : undefined,
+  };
+}
+
 async function send() {
   const number = state.active?.number;
   if (state.sending || !number) return;
@@ -359,16 +382,7 @@ async function send() {
   showSendError(null);
   try {
     const body = { to: number, text: text || undefined };
-    if (file) {
-      const type = mediaType(file);
-      body.media = {
-        type,
-        base64: await toBase64(file),
-        mimeType: file.type || 'application/octet-stream',
-        fileName: file.name,
-        ptt: type === 'audio' ? $('ptt')?.checked : undefined,
-      };
-    }
+    if (file) body.media = await mediaPayload(file, $('ptt')?.checked);
     const r = await post('/api/messages', body);
     if (!r.ok) return showSendError(errorText(r));
     $('text').value = '';
@@ -401,6 +415,258 @@ $('text').addEventListener('keydown', (e) => {
   }
 });
 
+// ── Lote ────────────────────────────────────────────────────────────────────
+
+const MIN_INTERVAL_S = 15; // SEND_INTERVAL_SECONDS do gateway: 15 a 30 s entre envios do mesmo número.
+const MAX_INTERVAL_S = 30;
+
+const batchTargets = () => state.batchReview?.recipients.filter((r) => r.exists === true) ?? [];
+
+function openBatch() {
+  state.batchOpen = true;
+  state.active = null;
+  state.selectedId = null;
+  $('chat-title').textContent = 'Envio em lote';
+  $('chat-sub').textContent = '';
+  $('composer').hidden = true;
+  $('messages').hidden = true;
+  $('batch').hidden = false;
+  setView('chat');
+  renderConversations();
+  renderSelected();
+  renderBatchReview();
+  loadBatches();
+}
+
+function showBatchError(text) {
+  const el = $('batch-error');
+  el.textContent = text ?? '';
+  el.hidden = !text;
+}
+
+function renderBatchFile() {
+  const box = $('batch-attachment');
+  const f = state.batchFile;
+  box.hidden = !f;
+  if (!f) return box.replaceChildren();
+  box.replaceChildren(
+    h('strong', {}, f.name),
+    h('button', { type: 'button', class: 'link', onclick: clearBatchFile }, 'Remover anexo'),
+  );
+}
+
+function clearBatchFile() {
+  state.batchFile = null;
+  $('batch-file').value = '';
+  renderBatchFile();
+}
+
+/// Ritmo e limite do dia, do mesmo estado de pool que o painel mostra.
+function batchForecast(count) {
+  const numbers = (state.pool?.numbers ?? []).filter((n) => n.inRotation);
+  if (!numbers.length) return ['Nenhum número no rodízio: as mensagens ficam retidas até um voltar.'];
+  const minutes = (seconds) => Math.max(1, Math.ceil((count * seconds) / numbers.length / 60));
+  const lines = [`Ritmo do gateway: cerca de ${minutes(MIN_INTERVAL_S)} a ${minutes(MAX_INTERVAL_S)} min para sair tudo.`];
+  const free = numbers.reduce((sum, n) => sum + Math.max(0, n.dailyLimit - n.sentToday), 0) - (state.pool.pending ?? 0);
+  if (count > free) lines.push(`Restam ${Math.max(0, free)} envios hoje: o excedente fica retido por limite diário.`);
+  return lines;
+}
+
+function renderBatchReview() {
+  const box = $('batch-review');
+  const review = state.batchReview;
+  const targets = batchTargets();
+  const button = $('batch-send');
+  button.disabled = !targets.length || state.batchSending;
+  button.setAttribute('aria-busy', String(state.batchSending));
+  button.textContent = state.batchSending ? 'Enviando…' : targets.length ? `Enviar para ${targets.length}` : 'Enviar';
+  if (!review) return box.replaceChildren(h('p', { class: 'hint' }, 'Clique em Verificar números para liberar o envio.'));
+  const label = (r) => {
+    if (r.exists === true) return h('td', {}, 'Tem WhatsApp');
+    return h('td', { class: 'bad' }, r.exists === false ? 'Sem WhatsApp: fica fora' : 'Sem resposta: fica fora');
+  };
+  box.replaceChildren(
+    ...(targets.length ? batchForecast(targets.length) : ['Nenhum número pode receber este lote.']).map((t) =>
+      h('p', { class: 'batch-summary' }, t),
+    ),
+    review.invalid.length ? h('p', { class: 'hint bad' }, `Inválidos, ficam fora: ${review.invalid.join(' · ')}`) : null,
+    review.duplicates.length ? h('p', { class: 'hint' }, `Repetidos, enviados uma vez: ${review.duplicates.join(' · ')}`) : null,
+    h(
+      'table',
+      { class: 'batch-table' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Número'), h('th', {}, 'Nome'), h('th', {}, 'Verificação'))),
+      h('tbody', {}, ...review.recipients.map((r) => h('tr', {}, h('td', { class: 'num' }, r.number), h('td', {}, r.name ?? ''), label(r)))),
+    ),
+  );
+}
+
+function batchRow(m) {
+  const stop = renderStop(m);
+  const kind = m.status === 'failed' ? 'bad' : m.holdReason ? 'hold' : '';
+  const status = STOPS.find(([s]) => s === m.status)?.[1];
+  return h(
+    'tr',
+    {},
+    h(
+      'td',
+      { class: 'num' },
+      h('button', { type: 'button', class: 'link', onclick: () => openBatchMessage(m) }, m.number ?? m.key),
+    ),
+    h('td', { class: kind }, stop?.textContent ?? status ?? m.status),
+  );
+}
+
+function openBatchMessage(m) {
+  openConversation(state.conversations.find((c) => c.key === m.key) ?? { key: m.key, number: m.number, lid: null });
+}
+
+function renderBatchProgress() {
+  const box = $('batch-progress');
+  if (!state.batchId) return box.replaceChildren();
+  const messages = state.batchMessages;
+  const { rejected = [], skipped = [] } = state.batchOutcome ?? {};
+  const count = (status) => messages.filter((m) => m.status === status).length;
+  const held = messages.filter((m) => m.holdReason).length;
+  const sentOut = count('sent') + count('delivered') + count('read');
+  box.replaceChildren(
+    h('h3', { class: 'batch-title' }, 'Andamento do lote'),
+    h(
+      'p',
+      { class: 'batch-summary' },
+      `${sentOut} de ${messages.length} saíram · ${count('queued') - held} na fila · ${held} retidas · ${count('failed')} falharam`,
+    ),
+    h(
+      'table',
+      { class: 'batch-table' },
+      h(
+        'tbody',
+        {},
+        ...messages.map(batchRow),
+        ...rejected.map((r) =>
+          h('tr', {}, h('td', { class: 'num' }, r.number), h('td', { class: 'bad' }, `Recusada: ${r.error?.message ?? `HTTP ${r.status}`}`)),
+        ),
+        ...skipped.map((r) =>
+          h('tr', {}, h('td', { class: 'num' }, r.number), h('td', { class: 'bad' }, 'Não enviada: o lote parou antes')),
+        ),
+      ),
+    ),
+  );
+}
+
+function renderBatchHistory() {
+  const list = $('batch-history');
+  if (!state.batches.length) {
+    list.replaceChildren(h('li', { class: 'empty' }, 'Nenhum lote enviado ainda.'));
+    return;
+  }
+  list.replaceChildren(
+    ...state.batches.map((b) =>
+      h(
+        'li',
+        {},
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'conversation',
+            'aria-current': b.id === state.batchId ? 'true' : 'false',
+            onclick: () => selectBatch(b.id),
+          },
+          h('strong', {}, `${new Date(b.createdAt).toLocaleDateString('pt-BR')} ${clock(b.createdAt)}`),
+          h('span', {}, `${b.total} mensagens`),
+        ),
+      ),
+    ),
+  );
+}
+
+function selectBatch(id) {
+  state.batchId = id;
+  state.batchOutcome = null;
+  loadBatches();
+}
+
+async function loadBatches() {
+  const r = await api('/api/batches');
+  state.batches = r.body?.batches ?? [];
+  if (state.batchId) {
+    const id = state.batchId;
+    const b = await api(`/api/batches/${encodeURIComponent(id)}`);
+    if (id !== state.batchId) return;
+    state.batchMessages = b.body?.messages ?? [];
+  }
+  renderBatchProgress();
+  renderBatchHistory();
+}
+
+async function checkBatch() {
+  const button = $('batch-check');
+  button.disabled = true;
+  showBatchError(null);
+  try {
+    const r = await post('/api/batches/check', { list: $('batch-list').value });
+    if (!r.ok) {
+      state.batchReview = null;
+      return showBatchError(errorText(r));
+    }
+    state.batchReview = r.body;
+  } finally {
+    button.disabled = false;
+    renderBatchReview();
+  }
+}
+
+async function sendBatch() {
+  const targets = batchTargets();
+  const text = $('batch-text').value.trim();
+  const file = state.batchFile;
+  if (state.batchSending || !targets.length) return;
+  if (!text && !file) return showBatchError('Escreva a mensagem ou anexe um arquivo.');
+  if (!window.confirm(`Enviar de verdade para ${targets.length} números?`)) return;
+  state.batchSending = true;
+  renderBatchReview();
+  showBatchError(null);
+  try {
+    const body = { recipients: targets, text: text || undefined };
+    if (file) body.media = await mediaPayload(file);
+    const r = await post('/api/batches', body);
+    if (!r.ok) return showBatchError(errorText(r));
+    state.batchId = r.body.batchId;
+    state.batchOutcome = { rejected: r.body.rejected, skipped: r.body.skipped };
+    state.batchReview = null;
+    $('batch-list').value = '';
+    $('batch-text').value = '';
+    clearBatchFile();
+    await refreshAll();
+  } finally {
+    state.batchSending = false;
+    renderBatchReview();
+  }
+}
+
+$('open-batch').addEventListener('click', openBatch);
+$('batch-check').addEventListener('click', checkBatch);
+$('batch-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  sendBatch();
+});
+// Lista alterada depois da verificação: o que foi conferido não vale mais.
+$('batch-list').addEventListener('input', () => {
+  state.batchReview = null;
+  renderBatchReview();
+});
+$('batch-file').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (file.size > BIG_FILE_BYTES) {
+    showBatchError('Arquivo acima de 14 MB: em base64 ele passa do limite de 20 MB do gateway.');
+    return clearBatchFile();
+  }
+  showBatchError(null);
+  state.batchFile = file;
+  renderBatchFile();
+});
+
 // ── Painel ──────────────────────────────────────────────────────────────────
 
 async function renderPool() {
@@ -417,6 +683,7 @@ async function renderPool() {
     return box.replaceChildren(h('p', { class: 'notice bad' }, errorText({ status: data.poolStatus, body: data.pool })));
   }
   const pool = data.pool;
+  state.pool = pool;
   tag.textContent = pool.paused ? 'pausado' : pool.state;
   tag.className = `tag ${pool.paused ? 'degraded' : pool.state}`;
   const numbers = pool.numbers.map((n) => {
@@ -488,6 +755,7 @@ async function refreshAll() {
   renderConversations();
   renderEvents();
   await loadMessages();
+  if (state.batchOpen) await loadBatches();
 }
 
 $('back').addEventListener('click', () => setView('list'));
